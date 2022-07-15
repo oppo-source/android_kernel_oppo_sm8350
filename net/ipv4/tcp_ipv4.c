@@ -82,6 +82,15 @@
 
 #include <trace/events/tcp.h>
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+void (*match_ipa_ip_wakeup)(int type, struct sk_buff *skb) = NULL;
+EXPORT_SYMBOL(match_ipa_ip_wakeup);
+void (*match_ipa_tcp_wakeup)(int type, struct sock *sk) = NULL;
+EXPORT_SYMBOL(match_ipa_tcp_wakeup);
+void (*ipa_schedule_work)(void) = NULL;
+EXPORT_SYMBOL(ipa_schedule_work);
+#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
+
 #ifdef CONFIG_TCP_MD5SIG
 static int tcp_v4_md5_hash_hdr(char *md5_hash, const struct tcp_md5sig_key *key,
 			       __be32 daddr, __be32 saddr, const struct tcphdr *th);
@@ -343,7 +352,7 @@ void tcp_v4_mtu_reduced(struct sock *sk)
 
 	if ((1 << sk->sk_state) & (TCPF_LISTEN | TCPF_CLOSE))
 		return;
-	mtu = tcp_sk(sk)->mtu_info;
+	mtu = READ_ONCE(tcp_sk(sk)->mtu_info);
 	dst = inet_csk_update_pmtu(sk, mtu);
 	if (!dst)
 		return;
@@ -512,7 +521,7 @@ int tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 			if (sk->sk_state == TCP_LISTEN)
 				goto out;
 
-			tp->mtu_info = info;
+			WRITE_ONCE(tp->mtu_info, info);
 			if (!sock_owned_by_user(sk)) {
 				tcp_v4_mtu_reduced(sk);
 			} else {
@@ -1657,6 +1666,7 @@ int tcp_v4_early_demux(struct sk_buff *skb)
 bool tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
 {
 	u32 limit = READ_ONCE(sk->sk_rcvbuf) + READ_ONCE(sk->sk_sndbuf);
+	u32 tail_gso_size, tail_gso_segs;
 	struct skb_shared_info *shinfo;
 	const struct tcphdr *th;
 	struct tcphdr *thtail;
@@ -1664,6 +1674,7 @@ bool tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
 	unsigned int hdrlen;
 	bool fragstolen;
 	u32 gso_segs;
+	u32 gso_size;
 	int delta;
 
 	/* In case all data was pulled from skb frags (in __pskb_pull_tail()),
@@ -1689,13 +1700,6 @@ bool tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
 	 */
 	th = (const struct tcphdr *)skb->data;
 	hdrlen = th->doff * 4;
-	shinfo = skb_shinfo(skb);
-
-	if (!shinfo->gso_size)
-		shinfo->gso_size = skb->len - hdrlen;
-
-	if (!shinfo->gso_segs)
-		shinfo->gso_segs = 1;
 
 	tail = sk->sk_backlog.tail;
 	if (!tail)
@@ -1718,6 +1722,15 @@ bool tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
 		goto no_coalesce;
 
 	__skb_pull(skb, hdrlen);
+
+	shinfo = skb_shinfo(skb);
+	gso_size = shinfo->gso_size ?: skb->len;
+	gso_segs = shinfo->gso_segs ?: 1;
+
+	shinfo = skb_shinfo(tail);
+	tail_gso_size = shinfo->gso_size ?: (tail->len - hdrlen);
+	tail_gso_segs = shinfo->gso_segs ?: 1;
+
 	if (skb_try_coalesce(tail, skb, &fragstolen, &delta)) {
 		TCP_SKB_CB(tail)->end_seq = TCP_SKB_CB(skb)->end_seq;
 
@@ -1744,11 +1757,8 @@ bool tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
 		}
 
 		/* Not as strict as GRO. We only need to carry mss max value */
-		skb_shinfo(tail)->gso_size = max(shinfo->gso_size,
-						 skb_shinfo(tail)->gso_size);
-
-		gso_segs = skb_shinfo(tail)->gso_segs + shinfo->gso_segs;
-		skb_shinfo(tail)->gso_segs = min_t(u32, gso_segs, 0xFFFF);
+		shinfo->gso_size = max(gso_size, tail_gso_size);
+		shinfo->gso_segs = min_t(u32, gso_segs + tail_gso_segs, 0xFFFF);
 
 		sk->sk_backlog.len += delta;
 		__NET_INC_STATS(sock_net(sk),
@@ -1825,6 +1835,12 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	struct sock *sk;
 	int ret;
 
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+	if (match_ipa_ip_wakeup != NULL) {
+		match_ipa_ip_wakeup(1, skb);
+	}
+	#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
+
 	if (skb->pkt_type != PACKET_HOST)
 		goto discard_it;
 
@@ -1856,6 +1872,12 @@ lookup:
 			       th->dest, sdif, &refcounted);
 	if (!sk)
 		goto no_tcp_socket;
+
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+	if (match_ipa_tcp_wakeup != NULL) {
+		match_ipa_tcp_wakeup(1, sk);
+	}
+	#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
 
 process:
 	if (sk->sk_state == TCP_TIME_WAIT)
@@ -1984,6 +2006,11 @@ bad_packet:
 
 discard_it:
 	/* Discard frame. */
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+	if (ipa_schedule_work != NULL) {
+		ipa_schedule_work();
+	}
+	#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
 	kfree_skb(skb);
 	return 0;
 
@@ -2303,6 +2330,7 @@ static void *tcp_get_idx(struct seq_file *seq, loff_t pos)
 static void *tcp_seek_last_pos(struct seq_file *seq)
 {
 	struct tcp_iter_state *st = seq->private;
+	int bucket = st->bucket;
 	int offset = st->offset;
 	int orig_num = st->num;
 	void *rc = NULL;
@@ -2313,7 +2341,7 @@ static void *tcp_seek_last_pos(struct seq_file *seq)
 			break;
 		st->state = TCP_SEQ_STATE_LISTENING;
 		rc = listening_get_next(seq, NULL);
-		while (offset-- && rc)
+		while (offset-- && rc && bucket == st->bucket)
 			rc = listening_get_next(seq, rc);
 		if (rc)
 			break;
@@ -2324,7 +2352,7 @@ static void *tcp_seek_last_pos(struct seq_file *seq)
 		if (st->bucket > tcp_hashinfo.ehash_mask)
 			break;
 		rc = established_get_first(seq);
-		while (offset-- && rc)
+		while (offset-- && rc && bucket == st->bucket)
 			rc = established_get_next(seq, rc);
 	}
 
@@ -2699,6 +2727,11 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_sack = 1;
 	net->ipv4.sysctl_tcp_window_scaling = 1;
 	net->ipv4.sysctl_tcp_timestamps = 1;
+
+#if IS_ENABLED(CONFIG_OPLUS_BUG_STABILITY)
+	net->ipv4.sysctl_tcp_random_timestamp = 1;
+#endif /* CONFIG_OPLUS_BUG_STABILITY */
+
 	net->ipv4.sysctl_tcp_early_retrans = 3;
 	net->ipv4.sysctl_tcp_recovery = TCP_RACK_LOSS_DETECTION;
 	net->ipv4.sysctl_tcp_slow_start_after_idle = 1; /* By default, RFC2861 behavior.  */

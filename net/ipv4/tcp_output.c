@@ -45,6 +45,17 @@
 #include <linux/static_key.h>
 
 #include <trace/events/tcp.h>
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_APP_MONITOR)
+#include <trace/hooks/vh_oplus_app_monitor.h>
+#endif
+
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+void (*match_tcp_output)(struct sock *sk) = NULL;
+EXPORT_SYMBOL(match_tcp_output);
+void (*match_tcp_output_retrans)(struct sock *sk) = NULL;
+EXPORT_SYMBOL(match_tcp_output_retrans);
+#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
 
 /* Refresh clocks of a TCP socket,
  * ensuring monotically increasing values.
@@ -76,6 +87,10 @@ static void tcp_event_new_data_sent(struct sock *sk, struct sk_buff *skb)
 		tp->highest_sack = skb;
 
 	tp->packets_out += tcp_skb_pcount(skb);
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_APP_MONITOR)
+	trace_android_vh_oplus_app_monitor_update(sk, skb, 1, 0);
+	#endif /* CONFIG_OPLUS_FEATURE_APP_MONITOR */
+
 	if (!prior_packets || icsk->icsk_pending == ICSK_TIME_LOSS_PROBE)
 		tcp_rearm_rto(sk);
 
@@ -1164,6 +1179,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			      tcp_skb_pcount(skb));
 
 	tp->segs_out += tcp_skb_pcount(skb);
+
 	/* OK, its time to fill skb_shinfo(skb)->gso_{segs|size} */
 	skb_shinfo(skb)->gso_segs = tcp_skb_pcount(skb);
 	skb_shinfo(skb)->gso_size = tcp_skb_mss(skb);
@@ -1177,6 +1193,12 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	tcp_add_tx_delay(skb, tp);
 
 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
+
+	#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+	if (match_tcp_output != NULL) {
+		match_tcp_output(sk);
+	}
+	#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
 
 	if (unlikely(err > 0)) {
 		tcp_enter_cwr(sk);
@@ -1504,6 +1526,7 @@ int tcp_mtu_to_mss(struct sock *sk, int pmtu)
 	return __tcp_mtu_to_mss(sk, pmtu) -
 	       (tcp_sk(sk)->tcp_header_len - sizeof(struct tcphdr));
 }
+EXPORT_SYMBOL(tcp_mtu_to_mss);
 
 /* Inverse of above */
 int tcp_mss_to_mtu(struct sock *sk, int mss)
@@ -2912,7 +2935,6 @@ int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
 	unsigned int cur_mss;
 	int diff, len, err;
 
-
 	/* Inconclusive MTU probe */
 	if (icsk->icsk_mtup.probe_size)
 		icsk->icsk_mtup.probe_size = 0;
@@ -3017,7 +3039,16 @@ int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
 				  TCP_SKB_CB(skb)->seq, segs, err);
 
 	if (likely(!err)) {
+		#if IS_ENABLED(CONFIG_OPLUS_FEATURE_APP_MONITOR)
+		trace_android_vh_oplus_app_monitor_update(sk, skb, 1, 1);
+		#endif /* CONFIG_OPLUS_FEATURE_APP_MONITOR */
+
 		trace_tcp_retransmit_skb(sk, skb);
+		#if IS_ENABLED(CONFIG_OPLUS_FEATURE_NWPOWER)
+		if (match_tcp_output_retrans != NULL) {
+			match_tcp_output_retrans(sk);
+		}
+		#endif /* CONFIG_OPLUS_FEATURE_NWPOWER */
 	} else if (err != -EBUSY) {
 		NET_ADD_STATS(sock_net(sk), LINUX_MIB_TCPRETRANSFAIL, segs);
 	}
@@ -3838,6 +3869,7 @@ void tcp_send_probe0(struct sock *sk)
 		/* Cancel probe timer, if it is not required. */
 		icsk->icsk_probes_out = 0;
 		icsk->icsk_backoff = 0;
+		icsk->icsk_probes_tstamp = 0;
 		return;
 	}
 
@@ -3852,6 +3884,8 @@ void tcp_send_probe0(struct sock *sk)
 		 */
 		timeout = TCP_RESOURCE_PROBE_INTERVAL;
 	}
+
+	timeout = tcp_clamp_probe0_to_user_timeout(sk, timeout);
 	tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0, timeout, TCP_RTO_MAX, NULL);
 }
 

@@ -353,6 +353,13 @@ static int f2fs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	if (IS_DIRSYNC(dir))
 		f2fs_sync_fs(sbi->sb, 1);
 
+#ifdef OPLUS_FEATURE_UFSPLUS
+#ifdef CONFIG_FS_HPB
+	if (__is_hpb_file(dentry->d_name.name, inode))
+		set_inode_flag(inode, FI_HPB_INODE);
+#endif
+#endif /* OPLUS_FEATURE_UFSPLUS */
+
 	f2fs_balance_fs(sbi, true);
 	return 0;
 out:
@@ -537,6 +544,14 @@ static struct dentry *f2fs_lookup(struct inode *dir, struct dentry *dentry,
 		err = -EPERM;
 		goto out_iput;
 	}
+
+#ifdef OPLUS_FEATURE_UFSPLUS
+#ifdef CONFIG_FS_HPB
+	if (__is_hpb_file(dentry->d_name.name, inode))
+		set_inode_flag(inode, FI_HPB_INODE);
+#endif
+#endif /* OPLUS_FEATURE_UFSPLUS */
+
 out_splice:
 #ifdef CONFIG_UNICODE
 	if (!inode && IS_CASEFOLDED(dir)) {
@@ -848,7 +863,11 @@ static int __f2fs_tmpfile(struct inode *dir, struct dentry *dentry,
 
 	if (whiteout) {
 		f2fs_i_links_write(inode, false);
+
+		spin_lock(&inode->i_lock);
 		inode->i_state |= I_LINKABLE;
+		spin_unlock(&inode->i_lock);
+
 		*whiteout = inode;
 	} else {
 		d_tmpfile(dentry, inode);
@@ -901,6 +920,11 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	struct f2fs_dir_entry *old_entry;
 	struct f2fs_dir_entry *new_entry;
 	int err;
+#ifdef OPLUS_FEATURE_UFSPLUS
+#ifdef CONFIG_FS_HPB
+	struct inode *hpb_inode;
+#endif
+#endif /* OPLUS_FEATURE_UFSPLUS */
 
 	if (unlikely(f2fs_cp_error(sbi)))
 		return -EIO;
@@ -1034,7 +1058,11 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		err = f2fs_add_link(old_dentry, whiteout);
 		if (err)
 			goto put_out_dir;
+
+		spin_lock(&whiteout->i_lock);
 		whiteout->i_state &= ~I_LINKABLE;
+		spin_unlock(&whiteout->i_lock);
+
 		iput(whiteout);
 	}
 
@@ -1052,6 +1080,16 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 			f2fs_add_ino_entry(sbi, old_inode->i_ino,
 							TRANS_DIR_INO);
 	}
+
+#ifdef OPLUS_FEATURE_UFSPLUS
+#ifdef CONFIG_FS_HPB
+	hpb_inode = (new_inode)? : old_inode;
+	if (__is_hpb_file(new_dentry->d_name.name, hpb_inode))
+		set_inode_flag(hpb_inode, FI_HPB_INODE);
+	else
+		clear_inode_flag(hpb_inode, FI_HPB_INODE);
+#endif
+#endif /* OPLUS_FEATURE_UFSPLUS */
 
 	f2fs_unlock_op(sbi);
 
@@ -1285,9 +1323,18 @@ static const char *f2fs_encrypted_get_link(struct dentry *dentry,
 	return target;
 }
 
+static int f2fs_encrypted_symlink_getattr(const struct path *path,
+					  struct kstat *stat, u32 request_mask,
+					  unsigned int query_flags)
+{
+	f2fs_getattr(path, stat, request_mask, query_flags);
+
+	return fscrypt_symlink_getattr(path, stat);
+}
+
 const struct inode_operations f2fs_encrypted_symlink_inode_operations = {
 	.get_link       = f2fs_encrypted_get_link,
-	.getattr	= f2fs_getattr,
+	.getattr	= f2fs_encrypted_symlink_getattr,
 	.setattr	= f2fs_setattr,
 	.listxattr	= f2fs_listxattr,
 };
