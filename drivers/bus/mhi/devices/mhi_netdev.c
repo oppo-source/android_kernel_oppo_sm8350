@@ -151,7 +151,8 @@ static __be16 mhi_netdev_ip_type_trans(u8 data)
 
 static struct mhi_netbuf *mhi_netdev_alloc(struct device *dev,
 					   gfp_t gfp,
-					   unsigned int order)
+					   unsigned int order,
+					   bool try_lower)
 {
 	struct page *page;
 	struct mhi_netbuf *netbuf;
@@ -159,8 +160,17 @@ static struct mhi_netbuf *mhi_netdev_alloc(struct device *dev,
 	void *vaddr;
 
 	page = __dev_alloc_pages(gfp | __GFP_NOMEMALLOC, order);
-	if (!page)
-		return NULL;
+	if (!page) {
+		if (try_lower && order > 0) {
+			order = order - 1;
+			gfp &= ~__GFP_RETRY_MAYFAIL;
+			page = __dev_alloc_pages(gfp | __GFP_NOMEMALLOC, order);
+			if (!page)
+				return NULL;
+		} else {
+			return NULL;
+		}
+	}
 
 	vaddr = page_address(page);
 
@@ -169,6 +179,7 @@ static struct mhi_netbuf *mhi_netdev_alloc(struct device *dev,
 	netbuf->recycle = false;
 	mhi_buf = (struct mhi_buf *)netbuf;
 	mhi_buf->page = page;
+	mhi_buf->order = order;
 	mhi_buf->buf = vaddr;
 	mhi_buf->len = (void *)netbuf - vaddr;
 
@@ -178,7 +189,7 @@ static struct mhi_netbuf *mhi_netdev_alloc(struct device *dev,
 	mhi_buf->dma_addr = dma_map_page(dev, page, 0, mhi_buf->len,
 					 DMA_FROM_DEVICE);
 	if (dma_mapping_error(dev, mhi_buf->dma_addr)) {
-		__free_pages(mhi_buf->page, order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 		return NULL;
 	}
 
@@ -204,9 +215,9 @@ static int mhi_netdev_tmp_alloc(struct mhi_netdev *mhi_netdev,
 	for (i = 0; i < nr_tre; i++) {
 		struct mhi_buf *mhi_buf;
 		struct mhi_netbuf *netbuf = mhi_netdev_alloc(dev, GFP_ATOMIC,
-							     order);
+							     order, true);
 		if (!netbuf)
-			return -ENOMEM;
+			break;
 
 		mhi_buf = (struct mhi_buf *)netbuf;
 		netbuf->unmap = mhi_netdev_unmap_page;
@@ -217,13 +228,13 @@ static int mhi_netdev_tmp_alloc(struct mhi_netdev *mhi_netdev,
 			MSG_ERR("Failed to queue transfer, ret:%d\n", ret);
 			mhi_netdev_unmap_page(dev, mhi_buf->dma_addr,
 					      mhi_buf->len, DMA_FROM_DEVICE);
-			__free_pages(mhi_buf->page, order);
-			return ret;
+			__free_pages(mhi_buf->page, mhi_buf->order);
+			break;
 		}
 		mhi_netdev->abuffers++;
 	}
 
-	return 0;
+	return i;
 }
 
 static int mhi_netdev_queue_bg_pool(struct mhi_netdev *mhi_netdev,
@@ -286,7 +297,7 @@ static void mhi_netdev_queue(struct mhi_netdev *mhi_netdev,
 	struct list_head *pool = mhi_netdev->recycle_pool;
 	int nr_tre = mhi_get_no_free_descriptors(mhi_dev, DMA_FROM_DEVICE);
 	int i, ret;
-	const int  max_peek = 4;
+	const int  max_peek = 8;
 
 	MSG_VERB("Enter free_desc:%d\n", nr_tre);
 
@@ -342,7 +353,10 @@ static void mhi_netdev_queue(struct mhi_netdev *mhi_netdev,
 
 	/* recyling did not work, buffers are still busy allocate temp pkts */
 	if (i < nr_tre)
-		mhi_netdev_tmp_alloc(mhi_netdev, mhi_dev, nr_tre - i);
+		i += mhi_netdev_tmp_alloc(mhi_netdev, mhi_dev, nr_tre - i);
+
+	if (i < nr_tre)
+		MSG_ERR("can't fill the buffer, stil need %d TRE\n", nr_tre - i);
 }
 
 /* allocating pool of memory */
@@ -362,7 +376,7 @@ static int mhi_netdev_alloc_pool(struct mhi_netdev *mhi_netdev)
 
 	for (i = 0; i < mhi_netdev->pool_size; i++) {
 		/* allocate paged data */
-		netbuf = mhi_netdev_alloc(dev, GFP_KERNEL, order);
+		netbuf = mhi_netdev_alloc(dev, GFP_KERNEL, order, false);
 		if (!netbuf)
 			goto error_alloc_page;
 
@@ -381,7 +395,7 @@ error_alloc_page:
 		list_del(&mhi_buf->node);
 		dma_unmap_page(dev, mhi_buf->dma_addr, mhi_buf->len,
 			       DMA_FROM_DEVICE);
-		__free_pages(mhi_buf->page, order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 	}
 
 	kfree(pool);
@@ -398,7 +412,7 @@ static void mhi_netdev_free_pool(struct mhi_netdev *mhi_netdev)
 		list_del(&mhi_buf->node);
 		dma_unmap_page(dev, mhi_buf->dma_addr, mhi_buf->len,
 			       DMA_FROM_DEVICE);
-		__free_pages(mhi_buf->page, mhi_netdev->order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 	}
 
 	kfree(mhi_netdev->recycle_pool);
@@ -406,7 +420,7 @@ static void mhi_netdev_free_pool(struct mhi_netdev *mhi_netdev)
 	/* free the bg pool */
 	list_for_each_entry_safe(mhi_buf, tmp, mhi_netdev->bg_pool, node) {
 		list_del(&mhi_buf->node);
-		__free_pages(mhi_buf->page, mhi_netdev->order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 		mhi_netdev->bg_pool_size--;
 	}
 
@@ -430,10 +444,14 @@ static int mhi_netdev_alloc_thread(void *data)
 				if (kthread_should_stop())
 					goto exit_alloc;
 
-				netbuf = mhi_netdev_alloc(NULL, GFP_KERNEL,
-							  order);
+				/* add __GFP_RETRY_MAYFAIL flag to let page alloctor
+				 * don't involves OOM killer.
+				 * when fail to alloc high order, try with lower order
+				 */
+				netbuf = mhi_netdev_alloc(NULL, GFP_KERNEL | __GFP_RETRY_MAYFAIL,
+							  order, true);
 				if (!netbuf)
-					continue;
+					break;
 
 				mhi_buf = (struct mhi_buf *)netbuf;
 				list_add(&mhi_buf->node, &head);
@@ -445,6 +463,9 @@ static int mhi_netdev_alloc_thread(void *data)
 			list_splice_init(&head, mhi_netdev->bg_pool);
 			mhi_netdev->bg_pool_size += buffers;
 			spin_unlock_bh(&mhi_netdev->bg_lock);
+
+			if (i < NAPI_POLL_WEIGHT)
+				break;
 		}
 
 		/* replenish the ring */
@@ -460,7 +481,7 @@ static int mhi_netdev_alloc_thread(void *data)
 exit_alloc:
 	list_for_each_entry_safe(mhi_buf, tmp_buf, &head, node) {
 		list_del(&mhi_buf->node);
-		__free_pages(mhi_buf->page, order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 	}
 
 	return 0;
@@ -770,7 +791,7 @@ static void mhi_netdev_push_skb(struct mhi_netdev *mhi_netdev,
 
 	skb = alloc_skb(0, GFP_ATOMIC);
 	if (!skb) {
-		__free_pages(mhi_buf->page, mhi_netdev->order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 		return;
 	}
 
@@ -798,7 +819,7 @@ static void mhi_netdev_xfer_dl_cb(struct mhi_device *mhi_dev,
 
 	/* modem is down, drop the buffer */
 	if (mhi_result->transaction_status == -ENOTCONN) {
-		__free_pages(mhi_buf->page, mhi_netdev->order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 		return;
 	}
 
@@ -827,7 +848,7 @@ static void mhi_netdev_xfer_dl_cb(struct mhi_device *mhi_dev,
 
 		chain->tail = skb;
 	} else {
-		__free_pages(mhi_buf->page, mhi_netdev->order);
+		__free_pages(mhi_buf->page, mhi_buf->order);
 	}
 }
 
